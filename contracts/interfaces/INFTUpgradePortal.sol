@@ -60,6 +60,7 @@ interface INFTUpgradePortal {
     event CollectionWhitelistUpdated(address indexed collection, bool whitelisted);
     event WhitelistModeUpdated(bool enabled);
     event DefaultLogicUpdated(address indexed oldLogic, address indexed newLogic);
+    event AgentFactoryUpdated(address indexed oldFactory, address indexed newFactory);
     event BatchUpgradeCompleted(address indexed upgrader, uint256 count);
 
     // ============ CORE FUNCTIONS ============

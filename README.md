@@ -19,6 +19,94 @@ Want to exit?
  → original NFT returned to user
 ```
 
+## State Machine
+
+### Upgrade Record Lifecycle
+
+```
+  ┌───────────┐
+  │   None    │  NFT not in the system
+  └─────┬─────┘
+        │ user calls upgrade()
+        ▼
+  ┌───────────┐
+  │  Active   │  Original NFT locked, BAP-578 agent live
+  └─────┬─────┘
+        │ user calls unwrap()
+        ▼
+  ┌───────────┐
+  │ Unwrapped │  Agent terminated, original NFT returned
+  └───────────┘
+        │
+        ▼ user can upgrade the same NFT again (new cycle)
+```
+
+### What happens on-chain during upgrade
+
+```
+  User                    Portal                   AgentFactory             BAP-578 Agent
+   │                        │                          │                        │
+   │  approve(portal)       │                          │                        │
+   │──────────────────────►│                          │                        │
+   │                        │                          │                        │
+   │  upgrade() + 0.01 BNB  │                          │                        │
+   │──────────────────────►│                          │                        │
+   │                        │  transferFrom(user→portal)                        │
+   │                        │  (locks original NFT)    │                        │
+   │                        │                          │                        │
+   │                        │  createAgent() + 0.01 BNB│                        │
+   │                        │─────────────────────────►│                        │
+   │                        │                          │  deploy new BAP-578    │
+   │                        │                          │──────────────────────►│
+   │                        │                          │  mint token #1→portal  │
+   │                        │◄─────────────────────────│                        │
+   │                        │                          │                        │
+   │                        │  transfer agent→user     │                        │
+   │◄──────────────────────│                          │                        │
+   │                        │                          │                        │
+   │  now owns BAP-578 agent│                          │                        │
+```
+
+### What happens on-chain during unwrap
+
+```
+  User                    Portal                   BAP-578 Agent
+   │                        │                          │
+   │  approve(portal)       │                          │
+   │──────────────────────►│                          │
+   │                        │                          │
+   │  unwrap(upgradeId)     │                          │
+   │──────────────────────►│                          │
+   │                        │  transferFrom(user→portal)│
+   │                        │  (takes agent token)     │
+   │                        │                          │
+   │                        │  terminate(tokenId)      │
+   │                        │─────────────────────────►│
+   │                        │  (BNB balance → portal)  │
+   │                        │◄─────────────────────────│
+   │                        │                          │
+   │  ◄── forward BNB ─────│                          │
+   │  ◄── return original ──│                          │
+   │                        │                          │
+   │  original NFT back     │                          │
+```
+
+### User journey (what you actually do)
+
+**To upgrade:**
+1. Go to the portal UI
+2. Pick an NFT from your wallet
+3. Click approve (one-time per NFT)
+4. Click upgrade, pay 0.01 BNB
+5. Done. You now have a BAP-578 agent. Set up learning, connect platforms, stake, whatever you want
+
+**To unwrap:**
+1. Go to the portal UI
+2. Find your upgrade in the list
+3. Click approve on the agent token
+4. Click unwrap
+5. Original NFT is back in your wallet. Any BNB left in the agent gets returned to you
+
 ## Why wrap instead of modify?
 
 We can't touch other people's contracts. If someone holds a BAYC or any third-party NFT, there's no way to inject BAP-578 functionality into that contract. So we wrap it. The original sits safe inside the portal, and a new BAP-578 agent is created with a permanent on-chain link back to it. One original per agent, always reversible.

@@ -60,6 +60,9 @@ contract NFTUpgradePortal is
     // Statistics
     uint256 public totalActiveUpgrades;
 
+    // Reentrancy flag for accepting NFTs during upgrade flow
+    bool private _upgradeInProgress;
+
     // Storage gap for future upgrades
     uint256[50] private __gap;
 
@@ -117,7 +120,9 @@ contract NFTUpgradePortal is
         returns (uint256 upgradeId)
     {
         require(msg.value == FACTORY_FEE + upgradeFee, "Portal: incorrect fee");
+        _upgradeInProgress = true;
         upgradeId = _upgrade(params, msg.sender);
+        _upgradeInProgress = false;
     }
 
     /**
@@ -142,9 +147,11 @@ contract NFTUpgradePortal is
         );
 
         upgradeIds = new uint256[](count);
+        _upgradeInProgress = true;
         for (uint256 i = 0; i < count; i++) {
             upgradeIds[i] = _upgrade(paramsList[i], msg.sender);
         }
+        _upgradeInProgress = false;
 
         emit BatchUpgradeCompleted(msg.sender, count);
     }
@@ -424,7 +431,9 @@ contract NFTUpgradePortal is
 
     function setAgentFactory(address newFactory) external onlyOwner {
         require(newFactory != address(0), "Portal: factory is zero");
+        address oldFactory = address(agentFactory);
         agentFactory = AgentFactory(newFactory);
+        emit AgentFactoryUpdated(oldFactory, newFactory);
     }
 
     function withdrawFees() external onlyOwner {
@@ -461,7 +470,10 @@ contract NFTUpgradePortal is
         address,
         uint256,
         bytes calldata
-    ) external pure override returns (bytes4) {
+    ) external view override returns (bytes4) {
+        // Only accept NFTs during an active upgrade/unwrap flow.
+        // Reject random safeTransfers to prevent NFTs getting stuck.
+        require(_upgradeInProgress, "Portal: unsolicited NFT rejected");
         return IERC721ReceiverUpgradeable.onERC721Received.selector;
     }
 
