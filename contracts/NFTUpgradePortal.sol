@@ -60,6 +60,9 @@ contract NFTUpgradePortal is
     // Statistics
     uint256 public totalActiveUpgrades;
 
+    // Fee accounting
+    uint256 public accumulatedFees;
+
     // Reentrancy flag for accepting NFTs during upgrade flow
     bool private _upgradeInProgress;
 
@@ -183,17 +186,20 @@ contract NFTUpgradePortal is
         // Transfer agent to portal (caller must have approved)
         agentContract.transferFrom(msg.sender, address(this), agentTokenId);
 
-        // Record balance before terminate to forward any remaining funds
+        // Try to terminate the agent. If terminate fails for any reason,
+        // return the agent to the user so they don't lose both assets.
         uint256 balanceBefore = address(this).balance;
-
-        // Terminate the agent (sends remaining balance to ownerOf = portal)
-        agentContract.terminate(agentTokenId);
-
-        // Forward any BNB received from termination to the user
-        uint256 balanceReceived = address(this).balance - balanceBefore;
-        if (balanceReceived > 0) {
-            (bool sent, ) = payable(msg.sender).call{value: balanceReceived}("");
-            require(sent, "Portal: BNB forward failed");
+        try agentContract.terminate(agentTokenId) {
+            // Forward any BNB received from termination to the user
+            uint256 balanceReceived = address(this).balance - balanceBefore;
+            if (balanceReceived > 0) {
+                (bool sent, ) = payable(msg.sender).call{value: balanceReceived}("");
+                require(sent, "Portal: BNB forward failed");
+            }
+        } catch {
+            // Terminate failed — return agent to user, abort unwrap
+            agentContract.transferFrom(address(this), msg.sender, agentTokenId);
+            revert("Portal: terminate failed, agent returned");
         }
 
         // Return original NFT to user
@@ -301,6 +307,7 @@ contract NFTUpgradePortal is
         _userUpgrades[upgrader].push(upgradeId);
 
         totalActiveUpgrades++;
+        accumulatedFees += upgradeFee;
 
         emit NFTUpgraded(
             upgradeId,
@@ -372,6 +379,31 @@ contract NFTUpgradePortal is
         return _userUpgrades[user];
     }
 
+    function getUserUpgradesPaginated(
+        address user,
+        uint256 offset,
+        uint256 limit
+    ) external view returns (uint256[] memory) {
+        uint256[] storage all = _userUpgrades[user];
+        if (offset >= all.length) {
+            return new uint256[](0);
+        }
+        uint256 end = offset + limit;
+        if (end > all.length) {
+            end = all.length;
+        }
+        uint256 size = end - offset;
+        uint256[] memory page = new uint256[](size);
+        for (uint256 i = 0; i < size; i++) {
+            page[i] = all[offset + i];
+        }
+        return page;
+    }
+
+    function getUserUpgradeCount(address user) external view returns (uint256) {
+        return _userUpgrades[user].length;
+    }
+
     function isCollectionWhitelisted(address collection)
         external
         view
@@ -437,9 +469,10 @@ contract NFTUpgradePortal is
     }
 
     function withdrawFees() external onlyOwner {
-        uint256 balance = address(this).balance;
-        require(balance > 0, "Portal: no fees to withdraw");
-        (bool sent, ) = payable(owner()).call{value: balance}("");
+        uint256 amount = accumulatedFees;
+        require(amount > 0, "Portal: no fees to withdraw");
+        accumulatedFees = 0;
+        (bool sent, ) = payable(owner()).call{value: amount}("");
         require(sent, "Portal: withdraw failed");
     }
 

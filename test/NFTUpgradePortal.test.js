@@ -761,8 +761,7 @@ describe('NFTUpgradePortal', function () {
       // Perform an upgrade to accumulate fees
       await performUpgrade(user1);
 
-      const portalBalance = await ethers.provider.getBalance(portal.address);
-      expect(portalBalance).to.equal(UPGRADE_FEE);
+      expect(await portal.accumulatedFees()).to.equal(UPGRADE_FEE);
 
       const ownerBalanceBefore = await ethers.provider.getBalance(
         owner.address
@@ -777,6 +776,30 @@ describe('NFTUpgradePortal', function () {
       expect(ownerBalanceAfter.sub(ownerBalanceBefore).add(gasUsed)).to.equal(
         UPGRADE_FEE
       );
+      expect(await portal.accumulatedFees()).to.equal(0);
+    });
+
+    it('Should only withdraw tracked fees, not entire balance', async function () {
+      // Perform an upgrade (portal gets UPGRADE_FEE)
+      await performUpgrade(user1);
+
+      // Send extra BNB directly to portal
+      await owner.sendTransaction({
+        to: portal.address,
+        value: ethers.utils.parseEther('1.0'),
+      });
+
+      // Portal has UPGRADE_FEE + 1.0 BNB, but should only withdraw UPGRADE_FEE
+      const portalBalanceBefore = await ethers.provider.getBalance(portal.address);
+      expect(portalBalanceBefore).to.equal(
+        UPGRADE_FEE.add(ethers.utils.parseEther('1.0'))
+      );
+
+      await portal.withdrawFees();
+
+      const portalBalanceAfter = await ethers.provider.getBalance(portal.address);
+      // The extra 1.0 BNB should remain untouched
+      expect(portalBalanceAfter).to.equal(ethers.utils.parseEther('1.0'));
     });
 
     it('Should revert withdraw when no fees', async function () {
@@ -916,6 +939,72 @@ describe('NFTUpgradePortal', function () {
       const record = await portal.getUpgradeRecord(999);
       expect(record.originalCollection).to.equal(ethers.constants.AddressZero);
       expect(record.status).to.equal(0); // None
+    });
+  });
+
+  // ============ PAGINATION ============
+
+  describe('Pagination', function () {
+    it('Should return correct page of user upgrades', async function () {
+      // Create 5 upgrades
+      for (let i = 0; i < 5; i++) {
+        await performUpgrade(user1, `ipfs://QmNFT${i}`);
+      }
+
+      expect(await portal.getUserUpgradeCount(user1.address)).to.equal(5);
+
+      // Page 1: offset 0, limit 2
+      const page1 = await portal.getUserUpgradesPaginated(user1.address, 0, 2);
+      expect(page1.length).to.equal(2);
+      expect(page1[0]).to.equal(1);
+      expect(page1[1]).to.equal(2);
+
+      // Page 2: offset 2, limit 2
+      const page2 = await portal.getUserUpgradesPaginated(user1.address, 2, 2);
+      expect(page2.length).to.equal(2);
+      expect(page2[0]).to.equal(3);
+      expect(page2[1]).to.equal(4);
+
+      // Page 3: offset 4, limit 2 (only 1 left)
+      const page3 = await portal.getUserUpgradesPaginated(user1.address, 4, 2);
+      expect(page3.length).to.equal(1);
+      expect(page3[0]).to.equal(5);
+    });
+
+    it('Should return empty array when offset exceeds length', async function () {
+      await performUpgrade(user1);
+      const page = await portal.getUserUpgradesPaginated(user1.address, 100, 10);
+      expect(page.length).to.equal(0);
+    });
+
+    it('Should return correct count for user with no upgrades', async function () {
+      expect(await portal.getUserUpgradeCount(user1.address)).to.equal(0);
+    });
+  });
+
+  // ============ TERMINATE FALLBACK ============
+
+  describe('Terminate Fallback', function () {
+    it('Should return agent to user if terminate fails', async function () {
+      const { upgradeId, agentContract } = await performUpgrade(user1);
+
+      const agent = await ethers.getContractAt('BAP578', agentContract);
+
+      // Terminate the agent directly so the portal's terminate call will fail
+      // (agent already terminated = "BAP578: agent already terminated")
+      await agent.connect(user1).terminate(1);
+
+      // Agent is now terminated but record is still Active in portal.
+      // User still owns the agent token (terminated agents keep their owner).
+      // Approve portal and try to unwrap.
+      await agent.connect(user1).approve(portal.address, 1);
+
+      await expect(
+        portal.connect(user1).unwrap(upgradeId)
+      ).to.be.revertedWith('Portal: terminate failed, agent returned');
+
+      // Agent should be back with user, not stuck in portal
+      expect(await agent.ownerOf(1)).to.equal(user1.address);
     });
   });
 });
