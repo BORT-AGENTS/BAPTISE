@@ -1,0 +1,26 @@
+{
+  "name": "baptise",
+  "version": "1.0.0",
+  "description": "Upgrade any ERC-721 NFT into a BAP-578 autonomous agent",
+  "scripts": {
+    "compile": "npx hardhat compile",
+    "test": "npx hardhat test",
+    "deploy:testnet": "npx hardhat run scripts/deploy.js --network testnet",
+    "deploy:mainnet": "npx hardhat run scripts/deploy.js --network mainnet"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^4.9.6",
+    "@openzeppelin/contracts-upgradeable": "^4.9.6"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^1.0.6",
+    "@nomicfoundation/hardhat-verify": "^2.0.12",
+    "@nomiclabs/hardhat-ethers": "^2.2.3",
+    "@openzeppelin/hardhat-upgrades": "^1.28.0",
+    "chai": "^4.3.7",
+    "dotenv": "^16.0.3",
+    "ethers": "^5.7.2",
+    "hardhat": "^2.24.2"
+  },
+  "license": "MIT"
+}
