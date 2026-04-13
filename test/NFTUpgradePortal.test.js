@@ -410,7 +410,7 @@ describe('NFTUpgradePortal', function () {
       expect(await mockNFT.ownerOf(originalTokenId)).to.equal(user1.address);
     });
 
-    it('Should terminate the BAP-578 agent', async function () {
+    it('Should pause the BAP-578 agent (not terminate)', async function () {
       const { upgradeId, agentContract } = await performUpgrade(user1);
 
       const agent = await ethers.getContractAt('BAP578', agentContract);
@@ -419,7 +419,7 @@ describe('NFTUpgradePortal', function () {
       await portal.connect(user1).unwrap(upgradeId);
 
       const state = await agent.getState(1);
-      expect(state.status).to.equal(2); // Terminated
+      expect(state.status).to.equal(0); // Paused
     });
 
     it('Should update upgrade record', async function () {
@@ -463,27 +463,41 @@ describe('NFTUpgradePortal', function () {
       expect(await portal.getUpgradeByAgent(agentContract)).to.equal(0);
     });
 
-    it('Should allow re-upgrade after unwrap', async function () {
+    it('Should reactivate same agent on re-upgrade (not create new)', async function () {
       const { upgradeId, agentContract, originalTokenId } =
         await performUpgrade(user1);
 
-      // Unwrap
+      // Unwrap (pauses agent, stores for reactivation)
       const agent = await ethers.getContractAt('BAP578', agentContract);
       await agent.connect(user1).approve(portal.address, 1);
       await portal.connect(user1).unwrap(upgradeId);
 
-      // Re-approve and re-upgrade
+      // Verify previous agent stored
+      const prevAgent = await portal.getPreviousAgent(mockNFT.address, originalTokenId);
+      expect(prevAgent).to.equal(agentContract);
+
+      // Re-upgrade — only pays upgradeFee (no factory fee)
       await mockNFT.connect(user1).approve(portal.address, originalTokenId);
       const params = upgradeParams(mockNFT.address, originalTokenId);
       const tx = await portal
         .connect(user1)
-        .upgrade(params, { value: TOTAL_FEE });
+        .upgrade(params, { value: UPGRADE_FEE });
       const receipt = await tx.wait();
-      const event = receipt.events.find((e) => e.event === 'NFTUpgraded');
-      expect(event.args.upgradeId).to.equal(2); // New upgrade ID
+
+      // Should emit NFTReactivated, not NFTUpgraded
+      const reactivateEvent = receipt.events.find((e) => e.event === 'NFTReactivated');
+      expect(reactivateEvent).to.not.be.undefined;
+      expect(reactivateEvent.args.agentContract).to.equal(agentContract);
+
+      // Same agent contract, user owns it again
+      expect(await agent.ownerOf(1)).to.equal(user1.address);
+
+      // Previous agent cleared
+      const prevAgentAfter = await portal.getPreviousAgent(mockNFT.address, originalTokenId);
+      expect(prevAgentAfter).to.equal(ethers.constants.AddressZero);
     });
 
-    it('Should forward BNB from terminated agent to user', async function () {
+    it('Should forward BNB from agent on unwrap', async function () {
       const { upgradeId, agentContract } = await performUpgrade(user1);
 
       // Fund the agent with some BNB
@@ -982,29 +996,90 @@ describe('NFTUpgradePortal', function () {
     });
   });
 
-  // ============ TERMINATE FALLBACK ============
+  // ============ REACTIVATION ============
 
-  describe('Terminate Fallback', function () {
-    it('Should return agent to user if terminate fails', async function () {
-      const { upgradeId, agentContract } = await performUpgrade(user1);
+  describe('Reactivation', function () {
+    it('Should preserve agent state across unwrap and re-upgrade', async function () {
+      const { upgradeId, agentContract, originalTokenId } =
+        await performUpgrade(user1);
 
       const agent = await ethers.getContractAt('BAP578', agentContract);
 
-      // Terminate the agent directly so the portal's terminate call will fail
-      // (agent already terminated = "BAP578: agent already terminated")
+      // Agent is active
+      let state = await agent.getState(1);
+      expect(state.status).to.equal(1); // Active
+
+      // Unwrap — agent gets paused
+      await agent.connect(user1).approve(portal.address, 1);
+      await portal.connect(user1).unwrap(upgradeId);
+
+      // Agent is now paused, owned by portal
+      state = await agent.getState(1);
+      expect(state.status).to.equal(0); // Paused
+      expect(await agent.ownerOf(1)).to.equal(portal.address);
+
+      // Re-upgrade — reactivates same agent
+      await mockNFT.connect(user1).approve(portal.address, originalTokenId);
+      const params = upgradeParams(mockNFT.address, originalTokenId);
+      await portal.connect(user1).upgrade(params, { value: UPGRADE_FEE });
+
+      // Agent is active again, user owns it
+      state = await agent.getState(1);
+      expect(state.status).to.equal(1); // Active
+      expect(await agent.ownerOf(1)).to.equal(user1.address);
+    });
+
+    it('Should still work if agent was externally terminated before re-upgrade', async function () {
+      const { upgradeId, agentContract, originalTokenId } =
+        await performUpgrade(user1);
+
+      const agent = await ethers.getContractAt('BAP578', agentContract);
+
+      // User terminates agent directly (outside portal)
       await agent.connect(user1).terminate(1);
 
-      // Agent is now terminated but record is still Active in portal.
-      // User still owns the agent token (terminated agents keep their owner).
-      // Approve portal and try to unwrap.
+      // Approve and unwrap — pause will fail (already terminated) but unwrap continues
       await agent.connect(user1).approve(portal.address, 1);
+      await portal.connect(user1).unwrap(upgradeId);
 
-      await expect(
-        portal.connect(user1).unwrap(upgradeId)
-      ).to.be.revertedWith('Portal: terminate failed, agent returned');
+      // Previous agent is stored but terminated
+      const prevAgent = await portal.getPreviousAgent(mockNFT.address, originalTokenId);
+      expect(prevAgent).to.equal(agentContract);
 
-      // Agent should be back with user, not stuck in portal
+      // Re-upgrade — reactivation will try unpause (fails silently on terminated agent)
+      // but transfer should still work since portal owns the token
+      await mockNFT.connect(user1).approve(portal.address, originalTokenId);
+      const params = upgradeParams(mockNFT.address, originalTokenId);
+      const tx = await portal.connect(user1).upgrade(params, { value: UPGRADE_FEE });
+      const receipt = await tx.wait();
+
+      // Should still emit reactivated event (agent contract reused)
+      const event = receipt.events.find((e) => e.event === 'NFTReactivated');
+      expect(event).to.not.be.undefined;
+
+      // User owns the agent token again (even though status is Terminated)
       expect(await agent.ownerOf(1)).to.equal(user1.address);
+    });
+
+    it('Should charge only upgradeFee for reactivation, not factory fee', async function () {
+      const { upgradeId, agentContract, originalTokenId } =
+        await performUpgrade(user1);
+
+      const agent = await ethers.getContractAt('BAP578', agentContract);
+      await agent.connect(user1).approve(portal.address, 1);
+      await portal.connect(user1).unwrap(upgradeId);
+
+      await mockNFT.connect(user1).approve(portal.address, originalTokenId);
+      const params = upgradeParams(mockNFT.address, originalTokenId);
+
+      // Full fee should fail
+      await expect(
+        portal.connect(user1).upgrade(params, { value: TOTAL_FEE })
+      ).to.be.revertedWith('Portal: incorrect fee (reactivation)');
+
+      // Only upgrade fee should work
+      await portal.connect(user1).upgrade(params, { value: UPGRADE_FEE });
+      expect(await portal.getTotalUpgrades()).to.equal(2);
     });
   });
 });

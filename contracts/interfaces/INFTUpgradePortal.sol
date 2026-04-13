@@ -62,6 +62,13 @@ interface INFTUpgradePortal {
     event DefaultLogicUpdated(address indexed oldLogic, address indexed newLogic);
     event AgentFactoryUpdated(address indexed oldFactory, address indexed newFactory);
     event BatchUpgradeCompleted(address indexed upgrader, uint256 count);
+    event NFTReactivated(
+        uint256 indexed upgradeId,
+        address indexed originalCollection,
+        uint256 indexed originalTokenId,
+        address agentContract,
+        address upgrader
+    );
 
     // ============ CORE FUNCTIONS ============
 

@@ -66,8 +66,11 @@ contract NFTUpgradePortal is
     // Reentrancy flag for accepting NFTs during upgrade flow
     bool private _upgradeInProgress;
 
+    // Paused agents available for reactivation: originalKey => agent contract
+    mapping(bytes32 => address) private _previousAgent;
+
     // Storage gap for future upgrades
-    uint256[50] private __gap;
+    uint256[48] private __gap;
 
     // ============ MODIFIERS ============
 
@@ -122,7 +125,16 @@ contract NFTUpgradePortal is
         whenNotPaused
         returns (uint256 upgradeId)
     {
-        require(msg.value == FACTORY_FEE + upgradeFee, "Portal: incorrect fee");
+        // Check if a previous agent exists for reactivation (cheaper, no factory fee)
+        bytes32 key = _originalKey(params.collection, params.tokenId);
+        bool hasReactivatable = _previousAgent[key] != address(0);
+
+        if (hasReactivatable) {
+            require(msg.value == upgradeFee, "Portal: incorrect fee (reactivation)");
+        } else {
+            require(msg.value == FACTORY_FEE + upgradeFee, "Portal: incorrect fee");
+        }
+
         _upgradeInProgress = true;
         upgradeId = _upgrade(params, msg.sender);
         _upgradeInProgress = false;
@@ -161,6 +173,8 @@ contract NFTUpgradePortal is
 
     /**
      * @dev Unwraps a BAP-578 agent back to the original NFT.
+     *      The agent is paused (not terminated) so it can be reactivated
+     *      if the user upgrades the same NFT again — preserving all history.
      *      Caller must be the current owner of the BAP-578 agent token
      *      and must have approved the portal to transfer it.
      * @param upgradeId The ID of the upgrade record
@@ -186,20 +200,23 @@ contract NFTUpgradePortal is
         // Transfer agent to portal (caller must have approved)
         agentContract.transferFrom(msg.sender, address(this), agentTokenId);
 
-        // Try to terminate the agent. If terminate fails for any reason,
-        // return the agent to the user so they don't lose both assets.
+        // Withdraw any BNB balance from the agent and forward to user
         uint256 balanceBefore = address(this).balance;
-        try agentContract.terminate(agentTokenId) {
-            // Forward any BNB received from termination to the user
+        try agentContract.withdrawFromAgent(agentTokenId, agentContract.getState(agentTokenId).balance) {
             uint256 balanceReceived = address(this).balance - balanceBefore;
             if (balanceReceived > 0) {
                 (bool sent, ) = payable(msg.sender).call{value: balanceReceived}("");
                 require(sent, "Portal: BNB forward failed");
             }
         } catch {
-            // Terminate failed — return agent to user, abort unwrap
-            agentContract.transferFrom(address(this), msg.sender, agentTokenId);
-            revert("Portal: terminate failed, agent returned");
+            // No balance or withdraw failed — continue
+        }
+
+        // Pause the agent (not terminate) so it can be reactivated later
+        try agentContract.pause(agentTokenId) {
+            // Agent paused, stored for reactivation
+        } catch {
+            // Agent might already be paused or terminated externally — continue
         }
 
         // Return original NFT to user
@@ -209,12 +226,15 @@ contract NFTUpgradePortal is
             record.originalTokenId
         );
 
+        // Store agent for reactivation
+        bytes32 key = _originalKey(record.originalCollection, record.originalTokenId);
+        _previousAgent[key] = record.agentContract;
+
         // Update record
         record.status = UpgradeStatus.Unwrapped;
         record.unwrapTimestamp = block.timestamp;
 
-        // Clear one-to-one mapping so NFT can be re-upgraded
-        bytes32 key = _originalKey(record.originalCollection, record.originalTokenId);
+        // Clear active mapping so NFT can be re-upgraded
         delete _originalToUpgradeId[key];
         delete _agentToUpgradeId[record.agentContract];
 
@@ -262,28 +282,37 @@ contract NFTUpgradePortal is
         // Try to cache tokenURI from original
         string memory cachedURI = _tryGetTokenURI(params.collection, params.tokenId);
 
-        // Resolve logic address
-        address logicAddr = params.logicAddress != address(0)
-            ? params.logicAddress
-            : defaultLogicAddress;
-
-        // Create BAP-578 agent via factory (mints to this portal)
-        address agentAddr = agentFactory.createAgent{value: FACTORY_FEE}(
-            params.agentName,
-            params.agentSymbol,
-            logicAddr,
-            params.metadataURI
-        );
-
-        // Agent token ID is always 1 for newly created agent contracts
+        address agentAddr = _previousAgent[key];
         uint256 agentTokenId = 1;
+        bool reactivated = false;
 
-        // Transfer agent from portal to user
-        BAP578(payable(agentAddr)).transferFrom(
-            address(this),
-            upgrader,
-            agentTokenId
-        );
+        if (agentAddr != address(0)) {
+            // Reactivate previous agent — unpause and transfer back
+            BAP578 agent = BAP578(payable(agentAddr));
+            try agent.unpause(agentTokenId) {} catch {}
+            agent.transferFrom(address(this), upgrader, agentTokenId);
+            delete _previousAgent[key];
+            reactivated = true;
+        } else {
+            // No previous agent — create new one via factory
+            address logicAddr = params.logicAddress != address(0)
+                ? params.logicAddress
+                : defaultLogicAddress;
+
+            agentAddr = agentFactory.createAgent{value: FACTORY_FEE}(
+                params.agentName,
+                params.agentSymbol,
+                logicAddr,
+                params.metadataURI
+            );
+
+            // Transfer new agent from portal to user
+            BAP578(payable(agentAddr)).transferFrom(
+                address(this),
+                upgrader,
+                agentTokenId
+            );
+        }
 
         // Create upgrade record
         _upgradeIdCounter.increment();
@@ -309,14 +338,24 @@ contract NFTUpgradePortal is
         totalActiveUpgrades++;
         accumulatedFees += upgradeFee;
 
-        emit NFTUpgraded(
-            upgradeId,
-            params.collection,
-            params.tokenId,
-            agentAddr,
-            agentTokenId,
-            upgrader
-        );
+        if (reactivated) {
+            emit NFTReactivated(
+                upgradeId,
+                params.collection,
+                params.tokenId,
+                agentAddr,
+                upgrader
+            );
+        } else {
+            emit NFTUpgraded(
+                upgradeId,
+                params.collection,
+                params.tokenId,
+                agentAddr,
+                agentTokenId,
+                upgrader
+            );
+        }
     }
 
     function _originalKey(address collection, uint256 tokenId)
@@ -402,6 +441,10 @@ contract NFTUpgradePortal is
 
     function getUserUpgradeCount(address user) external view returns (uint256) {
         return _userUpgrades[user].length;
+    }
+
+    function getPreviousAgent(address collection, uint256 tokenId) external view returns (address) {
+        return _previousAgent[_originalKey(collection, tokenId)];
     }
 
     function isCollectionWhitelisted(address collection)
