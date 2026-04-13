@@ -1029,7 +1029,7 @@ describe('NFTUpgradePortal', function () {
       expect(await agent.ownerOf(1)).to.equal(user1.address);
     });
 
-    it('Should still work if agent was externally terminated before re-upgrade', async function () {
+    it('Should create new agent if previous was externally terminated', async function () {
       const { upgradeId, agentContract, originalTokenId } =
         await performUpgrade(user1);
 
@@ -1046,19 +1046,20 @@ describe('NFTUpgradePortal', function () {
       const prevAgent = await portal.getPreviousAgent(mockNFT.address, originalTokenId);
       expect(prevAgent).to.equal(agentContract);
 
-      // Re-upgrade — reactivation will try unpause (fails silently on terminated agent)
-      // but transfer should still work since portal owns the token
+      // Re-upgrade — fee check detects terminated agent, requires full fee
       await mockNFT.connect(user1).approve(portal.address, originalTokenId);
       const params = upgradeParams(mockNFT.address, originalTokenId);
-      const tx = await portal.connect(user1).upgrade(params, { value: UPGRADE_FEE });
+      const tx = await portal.connect(user1).upgrade(params, { value: TOTAL_FEE });
       const receipt = await tx.wait();
 
-      // Should still emit reactivated event (agent contract reused)
-      const event = receipt.events.find((e) => e.event === 'NFTReactivated');
+      // Should create a NEW agent (not reactivate terminated one)
+      const event = receipt.events.find((e) => e.event === 'NFTUpgraded');
       expect(event).to.not.be.undefined;
+      expect(event.args.agentContract).to.not.equal(agentContract);
 
-      // User owns the agent token again (even though status is Terminated)
-      expect(await agent.ownerOf(1)).to.equal(user1.address);
+      // Previous agent entry should be cleared
+      const prevAgentAfter = await portal.getPreviousAgent(mockNFT.address, originalTokenId);
+      expect(prevAgentAfter).to.equal(ethers.constants.AddressZero);
     });
 
     it('Should charge only upgradeFee for reactivation, not factory fee', async function () {

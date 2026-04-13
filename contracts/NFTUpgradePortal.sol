@@ -69,6 +69,9 @@ contract NFTUpgradePortal is
     // Paused agents available for reactivation: originalKey => agent contract
     mapping(bytes32 => address) private _previousAgent;
 
+    // Guard: tracks agent contracts held for reactivation
+    mapping(address => bool) private _heldForReactivation;
+
     // Storage gap for future upgrades
     uint256[48] private __gap;
 
@@ -125,9 +128,20 @@ contract NFTUpgradePortal is
         whenNotPaused
         returns (uint256 upgradeId)
     {
-        // Check if a previous agent exists for reactivation (cheaper, no factory fee)
+        // Check if a previous agent exists AND is reactivatable (not terminated)
         bytes32 key = _originalKey(params.collection, params.tokenId);
-        bool hasReactivatable = _previousAgent[key] != address(0);
+        bool hasReactivatable = false;
+        address prevAgent = _previousAgent[key];
+        if (prevAgent != address(0)) {
+            try BAP578(payable(prevAgent)).getState(1) returns (IBAP578.State memory s) {
+                hasReactivatable = (s.status != IBAP578.Status.Terminated);
+            } catch {}
+            // If terminated, clear the stale entries
+            if (!hasReactivatable) {
+                _heldForReactivation[prevAgent] = false;
+                delete _previousAgent[key];
+            }
+        }
 
         if (hasReactivatable) {
             require(msg.value == upgradeFee, "Portal: incorrect fee (reactivation)");
@@ -156,10 +170,18 @@ contract NFTUpgradePortal is
         uint256 count = paramsList.length;
         require(count > 0, "Portal: empty batch");
         require(count <= MAX_BATCH_SIZE, "Portal: batch too large");
-        require(
-            msg.value == count * (FACTORY_FEE + upgradeFee),
-            "Portal: incorrect total fee"
-        );
+
+        // Calculate correct total fee (reactivations don't need factory fee)
+        uint256 expectedFee = 0;
+        for (uint256 i = 0; i < count; i++) {
+            bytes32 key = _originalKey(paramsList[i].collection, paramsList[i].tokenId);
+            if (_previousAgent[key] != address(0)) {
+                expectedFee += upgradeFee;
+            } else {
+                expectedFee += FACTORY_FEE + upgradeFee;
+            }
+        }
+        require(msg.value == expectedFee, "Portal: incorrect total fee");
 
         upgradeIds = new uint256[](count);
         _upgradeInProgress = true;
@@ -229,6 +251,7 @@ contract NFTUpgradePortal is
         // Store agent for reactivation
         bytes32 key = _originalKey(record.originalCollection, record.originalTokenId);
         _previousAgent[key] = record.agentContract;
+        _heldForReactivation[record.agentContract] = true;
 
         // Update record
         record.status = UpgradeStatus.Unwrapped;
@@ -291,9 +314,12 @@ contract NFTUpgradePortal is
             BAP578 agent = BAP578(payable(agentAddr));
             try agent.unpause(agentTokenId) {} catch {}
             agent.transferFrom(address(this), upgrader, agentTokenId);
+            _heldForReactivation[agentAddr] = false;
             delete _previousAgent[key];
             reactivated = true;
-        } else {
+        }
+
+        if (!reactivated) {
             // No previous agent — create new one via factory
             address logicAddr = params.logicAddress != address(0)
                 ? params.logicAddress
@@ -536,6 +562,8 @@ contract NFTUpgradePortal is
                 "Portal: cannot recover active upgrade"
             );
         }
+        // Prevent recovering paused agent tokens held for reactivation
+        require(!_heldForReactivation[collection], "Portal: cannot recover reactivatable agent");
         IERC721(collection).transferFrom(address(this), to, tokenId);
     }
 
